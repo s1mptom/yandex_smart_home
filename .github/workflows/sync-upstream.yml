@@ -1,0 +1,112 @@
+name: sync-upstream
+
+# Rebuilds this fork as "clean upstream tag + our patches" and publishes a
+# release (HACS updates from releases). The patch is re-applied with sed on top
+# of the pristine upstream tag, so there are never any merge conflicts.
+#
+# Why a schedule and not a trigger on upstream tags: GitHub only delivers events
+# for THIS repo. Upstream (dext0r/yandex_smart_home) is a different repo we don't
+# own, so we can't subscribe to its tags/releases — we poll. To avoid useless
+# work, each run first checks whether the latest upstream tag is already released
+# here and exits early if so; real work happens only when upstream ships a new tag.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # daily 04:00 UTC (cheap: exits early when nothing new)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if the latest upstream tag is already released"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      RELAY_URL: https://shome-cloud.duckdns.org
+      UPSTREAM: https://github.com/dext0r/yandex_smart_home.git
+      BRANCH: dev                       # default branch of THIS fork
+      OLD_DOMAIN: yandex_smart_home
+      NEW_DOMAIN: yandex_smart_home_fork
+      NEW_NAME: "Yandex Smart Home (Fork)"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}   # pin gh to THIS fork (we add an 'upstream' remote, so gh must not target dext0r)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync + patch + release
+        run: |
+          set -e
+          git config user.name  "relay-sync"
+          git config user.email "relay-sync@users.noreply.github.com"
+
+          # Find the latest upstream tag.
+          git remote add upstream "$UPSTREAM" 2>/dev/null || true
+          git fetch upstream --tags --force
+          TAG=$(git ls-remote --tags --refs --sort=-v:refname upstream | head -1 | sed 's@.*refs/tags/@@')
+          echo "upstream latest tag: $TAG"
+
+          # Skip if that tag is already released here (unless 'force' was requested).
+          if [ "${{ inputs.force }}" != "true" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Upstream tag $TAG is already released here — nothing to do."
+            exit 0
+          fi
+          echo "New upstream tag (or forced) — rebuilding."
+
+          # Preserve THIS workflow across the upstream reset (it is not in upstream).
+          mkdir -p /tmp/keep
+          cp .github/workflows/sync-upstream.yml /tmp/keep/
+
+          # Reset the branch to the pristine upstream tag, then re-apply our patches.
+          git checkout -B "$BRANCH" "$TAG"
+
+          SRC="custom_components/$OLD_DOMAIN"
+
+          # 1) Functional change: point the cloud at our relay.
+          sed -i "s|https://yaha-cloud\.ru|$RELAY_URL|g" "$SRC/const.py"
+
+          # 2) Rename the integration domain so it installs ALONGSIDE the original
+          #    (HA refuses two integrations with the same domain). HTTP view paths
+          #    are derived from DOMAIN, so they don't collide either.
+          git mv "$SRC" "custom_components/$NEW_DOMAIN"
+          DST="custom_components/$NEW_DOMAIN"
+          sed -i "s|\"domain\": \"$OLD_DOMAIN\"|\"domain\": \"$NEW_DOMAIN\"|"          "$DST/manifest.json"
+          sed -i "s|\"name\": \"Yandex Smart Home\"|\"name\": \"$NEW_NAME\"|"          "$DST/manifest.json"
+          sed -i "s|^DOMAIN = \"$OLD_DOMAIN\"|DOMAIN = \"$NEW_DOMAIN\"|"               "$DST/const.py"
+
+          # 3) HACS metadata: rename + install from source (this fork ships no zip).
+          #    Use jq so we never leave invalid JSON (a trailing comma broke parsing).
+          jq --arg n "$NEW_NAME" '.name = $n | .zip_release = false | del(.filename)' hacs.json > hacs.json.tmp
+          mv hacs.json.tmp hacs.json
+
+          # Keep ONLY our sync workflow (drop upstream's CI/release/docs/stale here).
+          rm -rf .github
+          mkdir -p .github/workflows
+          cp /tmp/keep/sync-upstream.yml .github/workflows/
+
+          echo "--- verify ---"
+          grep -n 'CLOUD_BASE_URL'  "$DST/const.py"
+          grep -n '"domain"'        "$DST/manifest.json"
+          grep -n '^DOMAIN'         "$DST/const.py"
+
+          git add -A
+          git commit -m "fork: relay patch + (fork) domain on top of upstream $TAG"
+          git push --force origin "$BRANCH"
+
+          # The upstream tag of the same name was fetched locally and points to
+          # UNPATCHED upstream code. Move it onto our patched HEAD and push it,
+          # otherwise the release (and HACS) would serve the upstream version.
+          git tag -f "$TAG" "$BRANCH"
+          git push -f origin "refs/tags/$TAG"
+
+          # (Re)publish the release on that (now correct) tag.
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "Upstream $TAG + relay patch (CLOUD_BASE_URL -> $RELAY_URL) + domain renamed to $NEW_DOMAIN for parallel install."
