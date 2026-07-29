@@ -2,7 +2,7 @@
 
 from enum import StrEnum
 
-DOMAIN = "yandex_smart_home"
+DOMAIN = "yandex_smart_home_fork"
 DOCS_URL = "https://docs.yaha-cloud.ru/v1.1.x"
 
 CONF_SETTINGS = "settings"
@@ -74,8 +74,8 @@ CONF_NOTIFIER_OAUTH_TOKEN = "oauth_token"
 CONF_NOTIFIER_SKILL_ID = "skill_id"
 CONF_NOTIFIER_USER_ID = "user_id"
 
-CLOUD_BASE_URL = "https://yaha-cloud.ru"
-CLOUD_STREAM_BASE_URL = "https://stream.yaha-cloud.ru"
+CLOUD_BASE_URL = "https://shome-cloud.duckdns.org"
+CLOUD_STREAM_BASE_URL = "https://shome-cloud.duckdns.org/stream"
 
 EVENT_DEVICE_ACTION = "yandex_smart_home_device_action"
 ATTR_CAPABILITY = "capability"
