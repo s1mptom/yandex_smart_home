@@ -1,0 +1,675 @@
+diff --git a/custom_components/yandex_smart_home/capability_video.py b/custom_components/yandex_smart_home/capability_video.py
+index 4675d44..b8267df 100644
+--- a/custom_components/yandex_smart_home/capability_video.py
++++ b/custom_components/yandex_smart_home/capability_video.py
+@@ -56,7 +56,12 @@ class VideoStreamCapability(ActionOnlyCapabilityMixin, StateCapability[GetStream
+         if self._entry_data.use_cloud_stream:
+             cloud_stream = component.cloud_streams.get(entity_id)
+             if not cloud_stream:
+-                cloud_stream = CloudStreamManager(self._hass, stream, async_get_clientsession(self._hass))
++                cloud_stream = CloudStreamManager(
++                    self._hass,
++                    stream,
++                    async_get_clientsession(self._hass),
++                    self._entry_data.cloud_stream_base_url,
++                )
+                 component.cloud_streams[entity_id] = cloud_stream
+ 
+             await cloud_stream.async_start()
+diff --git a/custom_components/yandex_smart_home/cloud.py b/custom_components/yandex_smart_home/cloud.py
+index bb2ecea..e6e6b5e 100644
+--- a/custom_components/yandex_smart_home/cloud.py
++++ b/custom_components/yandex_smart_home/cloud.py
+@@ -16,7 +16,7 @@ from homeassistant.util import dt
+ from pydantic import BaseModel
+ 
+ from . import handlers
+-from .const import CLOUD_BASE_URL, DOMAIN, ISSUE_ID_RECONNECTING_TOO_FAST
++from .const import DOMAIN, ISSUE_ID_RECONNECTING_TOO_FAST
+ from .helpers import RequestData, SmartHomePlatform
+ 
+ if TYPE_CHECKING:
+@@ -28,7 +28,11 @@ DEFAULT_RECONNECTION_DELAY = 2
+ MAX_RECONNECTION_DELAY = 180
+ FAST_RECONNECTION_TIME = timedelta(seconds=6)
+ FAST_RECONNECTION_THRESHOLD = 5
+-BASE_API_URL = f"{CLOUD_BASE_URL}/api/home_assistant/v1"
++
++
++def base_api_url(base_url: str) -> str:
++    """Return base URL of the cloud API."""
++    return f"{base_url.rstrip('/')}/api/home_assistant/v1"
+ 
+ 
+ class CloudInstanceData(BaseModel):
+@@ -69,7 +73,7 @@ class CloudManager:
+         self._ws_active = True
+         self._unsub_connect: CALLBACK_TYPE | None = None
+ 
+-        self._url = f"{BASE_API_URL}/connect"
++        self._url = f"{base_api_url(entry_data.cloud_base_url)}/connect"
+ 
+     async def async_connect(self, *_: Any) -> None:
+         """Connect to the cloud."""
+@@ -166,26 +170,29 @@ class CloudManager:
+         self._unsub_connect = async_call_later(self._hass, self._ws_reconnect_delay, HassJob(self.async_connect))
+ 
+ 
+-async def register_instance(hass: HomeAssistant, platform: SmartHomePlatform | None = None) -> CloudInstanceData:
++async def register_instance(
++    hass: HomeAssistant, base_url: str, platform: SmartHomePlatform | None = None
++) -> CloudInstanceData:
+     """Register a new cloud instance."""
+     session = async_create_clientsession(hass)
++    api_url = base_api_url(base_url)
+ 
+     if platform:
+-        response = await session.post(f"{BASE_API_URL}/instance/register", json={"platform": platform.value})
++        response = await session.post(f"{api_url}/instance/register", json={"platform": platform.value})
+     else:
+-        response = await session.post(f"{BASE_API_URL}/instance/register")
++        response = await session.post(f"{api_url}/instance/register")
+ 
+     response.raise_for_status()
+ 
+     return CloudInstanceData.model_validate_json(await response.text())
+ 
+ 
+-async def get_instance_otp(hass: HomeAssistant, instance_id: str, token: str) -> str:
++async def get_instance_otp(hass: HomeAssistant, base_url: str, instance_id: str, token: str) -> str:
+     """Return one time password for a cloud instance linking."""
+     session = async_create_clientsession(hass)
+ 
+     response = await session.post(
+-        f"{BASE_API_URL}/instance/{instance_id}/otp",
++        f"{base_api_url(base_url)}/instance/{instance_id}/otp",
+         headers={hdrs.AUTHORIZATION: f"Bearer {token}"},
+     )
+     response.raise_for_status()
+@@ -193,12 +200,14 @@ async def get_instance_otp(hass: HomeAssistant, instance_id: str, token: str) ->
+     return CloudInstanceOTP.model_validate_json(await response.text()).code
+ 
+ 
+-async def reset_connection_token(hass: HomeAssistant, instance_id: str, token: str) -> CloudInstanceData:
++async def reset_connection_token(
++    hass: HomeAssistant, base_url: str, instance_id: str, token: str
++) -> CloudInstanceData:
+     """Reset a cloud instance connection token."""
+     session = async_create_clientsession(hass)
+ 
+     response = await session.post(
+-        f"{BASE_API_URL}/instance/{instance_id}/reset-connection-token",
++        f"{base_api_url(base_url)}/instance/{instance_id}/reset-connection-token",
+         headers={hdrs.AUTHORIZATION: f"Bearer {token}"},
+     )
+     response.raise_for_status()
+@@ -206,12 +215,12 @@ async def reset_connection_token(hass: HomeAssistant, instance_id: str, token: s
+     return CloudInstanceData.model_validate_json(await response.text())
+ 
+ 
+-async def revoke_oauth_tokens(hass: HomeAssistant, instance_id: str, token: str) -> None:
++async def revoke_oauth_tokens(hass: HomeAssistant, base_url: str, instance_id: str, token: str) -> None:
+     """Revoke all access and refresh tokens for a cloud instance."""
+     session = async_create_clientsession(hass)
+ 
+     response = await session.post(
+-        f"{BASE_API_URL}/instance/{instance_id}/oauth/revoke-all",
++        f"{base_api_url(base_url)}/instance/{instance_id}/oauth/revoke-all",
+         headers={hdrs.AUTHORIZATION: f"Bearer {token}"},
+     )
+     response.raise_for_status()
+diff --git a/custom_components/yandex_smart_home/cloud_stream.py b/custom_components/yandex_smart_home/cloud_stream.py
+index 1f598f5..dc5ee1f 100644
+--- a/custom_components/yandex_smart_home/cloud_stream.py
++++ b/custom_components/yandex_smart_home/cloud_stream.py
+@@ -32,8 +32,6 @@ from multidict import MultiDictProxy
+ from pydantic import BaseModel
+ import yarl
+ 
+-from .const import CLOUD_STREAM_BASE_URL
+-
+ _LOGGER = logging.getLogger(__name__)
+ 
+ RECONNECTION_DELAY = 2
+@@ -73,11 +71,12 @@ class WebRequest:
+ class CloudStreamManager:
+     """Class to manage cloud connection for streaming."""
+ 
+-    def __init__(self, hass: HomeAssistant, stream: Stream, session: ClientSession):
+-        """Initialize a cloud manager with stream and client session."""
++    def __init__(self, hass: HomeAssistant, stream: Stream, session: ClientSession, base_url: str):
++        """Initialize a cloud manager with stream, client session and cloud base URL."""
+ 
+         self._hass = hass
+         self._stream = stream
++        self._base_url = base_url.rstrip("/")
+         self._running_stream_id: str | None = None
+         self._session = session
+         self._connected = asyncio.Event()
+@@ -91,7 +90,7 @@ class CloudStreamManager:
+         if not self._running_stream_id:
+             return None
+ 
+-        return f"{CLOUD_STREAM_BASE_URL}/{self._running_stream_id}/master_playlist.m3u8"
++        return f"{self._base_url}/{self._running_stream_id}/master_playlist.m3u8"
+ 
+     async def async_start(self) -> None:
+         """Start connection."""
+@@ -117,7 +116,7 @@ class CloudStreamManager:
+         if not self._running_stream_id:
+             return
+ 
+-        ws_url = f"{CLOUD_STREAM_BASE_URL}/{self._running_stream_id}/connect"
++        ws_url = f"{self._base_url}/{self._running_stream_id}/connect"
+ 
+         try:
+             _LOGGER.debug(f"Connecting to {ws_url}")
+diff --git a/custom_components/yandex_smart_home/config_flow.py b/custom_components/yandex_smart_home/config_flow.py
+index 8c76cfa..b8fc839 100644
+--- a/custom_components/yandex_smart_home/config_flow.py
++++ b/custom_components/yandex_smart_home/config_flow.py
+@@ -25,19 +25,23 @@ from homeassistant.helpers.selector import (
+     SelectSelectorConfig,
+     SelectSelectorMode,
+     TextSelector,
++    TextSelectorConfig,
++    TextSelectorType,
+ )
+ from homeassistant.helpers.typing import ConfigType
+ from homeassistant.setup import async_setup_component
+ import voluptuous as vol
++import yarl
+ 
+ from . import DOMAIN, cloud
+ from .const import (
+-    CLOUD_BASE_URL,
++    CONF_CLOUD_BASE_URL,
+     CONF_CLOUD_INSTANCE,
+     CONF_CLOUD_INSTANCE_CONNECTION_TOKEN,
+     CONF_CLOUD_INSTANCE_ID,
+     CONF_CLOUD_INSTANCE_OTP,
+     CONF_CLOUD_INSTANCE_PASSWORD,
++    CONF_CLOUD_STREAM_BASE_URL,
+     CONF_CONNECTION_TYPE,
+     CONF_ENTRY_ALIASES,
+     CONF_FILTER,
+@@ -46,6 +50,8 @@ from .const import (
+     CONF_LINKED_PLATFORMS,
+     CONF_SKILL,
+     CONF_USER_ID,
++    DEFAULT_CLOUD_BASE_URL,
++    DEFAULT_CLOUD_STREAM_BASE_URL,
+     DOCS_URL,
+     ConnectionType,
+     EntityFilterSource,
+@@ -134,6 +140,39 @@ class BaseFlowHandler(FlowHandler["ConfigFlowContext", ConfigFlowResult]):
+ 
+         super().__init__()
+ 
++    @property
++    def _cloud_base_url(self) -> str:
++        """Return base URL of the cloud (relay) for the flow."""
++        return str(self._data.get(CONF_CLOUD_BASE_URL) or DEFAULT_CLOUD_BASE_URL)
++
++    @property
++    def _cloud_stream_base_url(self) -> str:
++        """Return base URL of the cloud (relay) used for video streaming."""
++        return str(self._data.get(CONF_CLOUD_STREAM_BASE_URL) or DEFAULT_CLOUD_STREAM_BASE_URL)
++
++    def _show_cloud_settings_form(self, user_input: ConfigType, errors: dict[str, str]) -> ConfigFlowResult:
++        """Show the form with cloud (relay) addresses."""
++        return self.async_show_form(
++            step_id="cloud_settings",
++            data_schema=vol.Schema(
++                {
++                    vol.Required(
++                        CONF_CLOUD_BASE_URL,
++                        default=user_input.get(CONF_CLOUD_BASE_URL, self._cloud_base_url),
++                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
++                    vol.Required(
++                        CONF_CLOUD_STREAM_BASE_URL,
++                        default=user_input.get(CONF_CLOUD_STREAM_BASE_URL, self._cloud_stream_base_url),
++                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
++                }
++            ),
++            errors=errors,
++            description_placeholders={
++                "default_cloud_base_url": DEFAULT_CLOUD_BASE_URL,
++                "default_cloud_stream_base_url": DEFAULT_CLOUD_STREAM_BASE_URL,
++            },
++        )
++
+     async def _async_step_skill_direct(
+         self, platform: SmartHomePlatform, user_input: ConfigType | None = None
+     ) -> ConfigFlowResult:
+@@ -227,7 +266,7 @@ class BaseFlowHandler(FlowHandler["ConfigFlowContext", ConfigFlowResult]):
+         """Choose skill settings for cloud plus connection."""
+         errors: dict[str, str] = {}
+         description_placeholders = {
+-            "cloud_base_url": CLOUD_BASE_URL,
++            "cloud_base_url": self._cloud_base_url,
+             "instance_id": self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
+             "docs_url": DOCS_URL,
+         }
+@@ -494,13 +533,39 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
+ 
+     async def async_step_connection_type(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
+         """Choose connection type."""
+-        errors = {}
+         if user_input is not None:
+             self._data.update(user_input)
+ 
+-            if user_input[CONF_CONNECTION_TYPE] == ConnectionType.CLOUD:
++            if user_input[CONF_CONNECTION_TYPE] == ConnectionType.DIRECT:
++                return await self.async_step_platform_direct()
++
++            return await self.async_step_cloud_settings()
++
++        return self.async_show_form(
++            step_id="connection_type",
++            data_schema=vol.Schema(
++                {vol.Required(CONF_CONNECTION_TYPE, default=ConnectionType.CLOUD): CONNECTION_TYPE_SELECTOR}
++            ),
++            description_placeholders={
++                "docs_url": DOCS_URL,
++                "yaha_cloud_skill_url": "https://dialogs.yandex.ru/store/skills/cef326b2-home-assistant",
++            },
++        )
++
++    async def async_step_cloud_settings(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
++        """Enter addresses of the cloud (relay) and register an instance there."""
++        errors: dict[str, str] = {}
++        if user_input is not None:
++            errors, cloud_settings = _validate_cloud_settings(user_input)
++
++            if not errors:
++                self._data.update(cloud_settings)
++
++                if self._data[CONF_CONNECTION_TYPE] == ConnectionType.CLOUD_PLUS:
++                    return await self.async_step_platform_cloud_plus()
++
+                 try:
+-                    instance = await cloud.register_instance(self.hass)
++                    instance = await cloud.register_instance(self.hass, self._cloud_base_url)
+                     self._data[CONF_CLOUD_INSTANCE] = {
+                         CONF_CLOUD_INSTANCE_ID: instance.id,
+                         CONF_CLOUD_INSTANCE_PASSWORD: instance.password,
+@@ -511,25 +576,11 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
+                     _LOGGER.exception("Failed to register instance in Yandex Smart Home cloud")
+ 
+             if not errors:
+-                match user_input[CONF_CONNECTION_TYPE]:
+-                    case ConnectionType.DIRECT:
+-                        return await self.async_step_platform_direct()
+-                    case ConnectionType.CLOUD_PLUS:
+-                        return await self.async_step_platform_cloud_plus()
+-
+                 return await self.async_step_expose_settings()
++        else:
++            user_input = {}
+ 
+-        return self.async_show_form(
+-            step_id="connection_type",
+-            data_schema=vol.Schema(
+-                {vol.Required(CONF_CONNECTION_TYPE, default=ConnectionType.CLOUD): CONNECTION_TYPE_SELECTOR}
+-            ),
+-            errors=errors,
+-            description_placeholders={
+-                "docs_url": DOCS_URL,
+-                "yaha_cloud_skill_url": "https://dialogs.yandex.ru/store/skills/cef326b2-home-assistant",
+-            },
+-        )
++        return self._show_cloud_settings_form(user_input, errors)
+ 
+     async def async_step_platform_direct(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
+         """Choose smart home platform for direct connection."""
+@@ -554,7 +605,9 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
+             self._data.update(user_input)
+ 
+             try:
+-                instance = await cloud.register_instance(self.hass, SmartHomePlatform(user_input[CONF_PLATFORM]))
++                instance = await cloud.register_instance(
++                    self.hass, self._cloud_base_url, SmartHomePlatform(user_input[CONF_PLATFORM])
++                )
+                 self._data[CONF_CLOUD_INSTANCE] = {
+                     CONF_CLOUD_INSTANCE_ID: instance.id,
+                     CONF_CLOUD_INSTANCE_PASSWORD: instance.password,
+@@ -592,6 +645,7 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
+             try:
+                 description_placeholders[CONF_CLOUD_INSTANCE_OTP] = await cloud.get_instance_otp(
+                     self.hass,
++                    self._cloud_base_url,
+                     self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
+                     self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
+                 )
+@@ -629,15 +683,36 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
+         options = ["expose_settings"]
+         match self._data[CONF_CONNECTION_TYPE]:
+             case ConnectionType.CLOUD:
+-                options += ["cloud_credentials", "context_user"]
++                options += ["cloud_settings", "cloud_credentials", "context_user"]
+             case ConnectionType.CLOUD_PLUS:
+-                options += ["cloud_credentials", f"skill_{self._data[CONF_PLATFORM]}_cloud_plus", "context_user"]
++                options += [
++                    "cloud_settings",
++                    "cloud_credentials",
++                    f"skill_{self._data[CONF_PLATFORM]}_cloud_plus",
++                    "context_user",
++                ]
+             case ConnectionType.DIRECT:
+                 options += [f"skill_{self._data[CONF_PLATFORM]}_direct"]
+         options += ["maintenance"]
+ 
+         return self.async_show_menu(step_id="init", menu_options=options)
+ 
++    async def async_step_cloud_settings(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
++        """Change addresses of the cloud (relay)."""
++        errors: dict[str, str] = {}
++        if user_input is not None:
++            errors, cloud_settings = _validate_cloud_settings(user_input)
++
++            if not errors:
++                self._data.update(cloud_settings)
++                self.hass.config_entries.async_update_entry(self._entry, data=self._data)
++
++                return await self.async_step_done()
++        else:
++            user_input = {}
++
++        return self._show_cloud_settings_form(user_input, errors)
++
+     async def async_step_cloud_credentials(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
+         """Show cloud connection credentials."""
+         errors = {}
+@@ -657,6 +732,7 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
+         try:
+             description_placeholders[CONF_CLOUD_INSTANCE_OTP] = await cloud.get_instance_otp(
+                 self.hass,
++                self._cloud_base_url,
+                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
+                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
+             )
+@@ -704,6 +780,7 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
+                         try:
+                             await cloud.revoke_oauth_tokens(
+                                 self.hass,
++                                self._cloud_base_url,
+                                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
+                                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
+                             )
+@@ -722,6 +799,7 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
+                 try:
+                     instance = await cloud.reset_connection_token(
+                         self.hass,
++                        self._cloud_base_url,
+                         self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
+                         self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
+                     )
+@@ -837,6 +915,26 @@ async def async_config_entry_title(hass: HomeAssistant, data: ConfigType, option
+     return title
+ 
+ 
++def _validate_cloud_settings(config: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
++    """Validate cloud (relay) addresses and return errors and normalized config."""
++    errors: dict[str, str] = {}
++    cloud_settings: dict[str, str] = {}
++
++    for key in (CONF_CLOUD_BASE_URL, CONF_CLOUD_STREAM_BASE_URL):
++        url = str(config.get(key, "")).strip().rstrip("/")
++        try:
++            parsed = yarl.URL(url)
++        except ValueError:
++            errors[key] = "invalid_url"
++        else:
++            if parsed.scheme not in ("http", "https") or not parsed.host:
++                errors[key] = "invalid_url"
++
++        cloud_settings[key] = url
++
++    return errors, cloud_settings
++
++
+ def _validate_skill_config(
+     platform: SmartHomePlatform, config: dict[str, str]
+ ) -> tuple[dict[str, str], dict[str, str]]:
+diff --git a/custom_components/yandex_smart_home/const.py b/custom_components/yandex_smart_home/const.py
+index e231e94..69421f6 100644
+--- a/custom_components/yandex_smart_home/const.py
++++ b/custom_components/yandex_smart_home/const.py
+@@ -15,6 +15,8 @@ CONF_CLOUD_INSTANCE_ID = "id"
+ CONF_CLOUD_INSTANCE_PASSWORD = "password"
+ CONF_CLOUD_INSTANCE_OTP = "otp"
+ CONF_CLOUD_INSTANCE_CONNECTION_TOKEN = "token"
++CONF_CLOUD_BASE_URL = "cloud_base_url"
++CONF_CLOUD_STREAM_BASE_URL = "cloud_stream_base_url"
+ CONF_USER_ID = "user_id"
+ CONF_SKILL = "skill"
+ CONF_COLOR_PROFILE = "color_profile"
+@@ -62,6 +64,7 @@ CONF_ENTITY_CUSTOM_RANGE_DECREASE_VALUE = "decrease_value"
+ ISSUE_ID_DEPRECATED_PRESSURE_UNIT = "deprecated_pressure_unit"
+ ISSUE_ID_DEPRECATED_YAML_NOTIFIER = "deprecated_yaml_notifier"
+ ISSUE_ID_DEPRECATED_YAML_SEVERAL_NOTIFIERS = "deprecated_yaml_several_notifiers"
++ISSUE_ID_MISSING_CLOUD_BASE_URL = "missing_cloud_base_url"
+ ISSUE_ID_MISSING_INTEGRATION = "missing_integration"
+ ISSUE_ID_MISSING_SKILL_DATA = "missing_skill_data"
+ ISSUE_ID_RECONNECTING_TOO_FAST = "reconnecting_too_fast"
+@@ -74,8 +77,10 @@ CONF_NOTIFIER_OAUTH_TOKEN = "oauth_token"
+ CONF_NOTIFIER_SKILL_ID = "skill_id"
+ CONF_NOTIFIER_USER_ID = "user_id"
+ 
+-CLOUD_BASE_URL = "https://yaha-cloud.ru"
+-CLOUD_STREAM_BASE_URL = "https://stream.yaha-cloud.ru"
++# Defaults only: the actual cloud/relay addresses are stored per config entry
++# (CONF_CLOUD_BASE_URL / CONF_CLOUD_STREAM_BASE_URL) and are entered in the UI.
++DEFAULT_CLOUD_BASE_URL = "https://yaha-cloud.ru"
++DEFAULT_CLOUD_STREAM_BASE_URL = "https://stream.yaha-cloud.ru"
+ 
+ EVENT_DEVICE_ACTION = "yandex_smart_home_device_action"
+ ATTR_CAPABILITY = "capability"
+diff --git a/custom_components/yandex_smart_home/entry_data.py b/custom_components/yandex_smart_home/entry_data.py
+index 7de5e54..85f4dae 100644
+--- a/custom_components/yandex_smart_home/entry_data.py
++++ b/custom_components/yandex_smart_home/entry_data.py
+@@ -30,10 +30,12 @@ from .cloud import CloudManager
+ from .color import ColorProfiles
+ from .const import (
+     CONF_BACKLIGHT_ENTITY_ID,
++    CONF_CLOUD_BASE_URL,
+     CONF_CLOUD_INSTANCE,
+     CONF_CLOUD_INSTANCE_CONNECTION_TOKEN,
+     CONF_CLOUD_INSTANCE_ID,
+     CONF_CLOUD_STREAM,
++    CONF_CLOUD_STREAM_BASE_URL,
+     CONF_COLOR_PROFILE,
+     CONF_CONNECTION_TYPE,
+     CONF_ENTITY_CUSTOM_MODES,
+@@ -50,11 +52,14 @@ from .const import (
+     CONF_SETTINGS,
+     CONF_SKILL,
+     CONF_USER_ID,
++    DEFAULT_CLOUD_BASE_URL,
++    DEFAULT_CLOUD_STREAM_BASE_URL,
+     DOCS_URL,
+     DOMAIN,
+     ISSUE_ID_DEPRECATED_PRESSURE_UNIT,
+     ISSUE_ID_DEPRECATED_YAML_NOTIFIER,
+     ISSUE_ID_DEPRECATED_YAML_SEVERAL_NOTIFIERS,
++    ISSUE_ID_MISSING_CLOUD_BASE_URL,
+     ISSUE_ID_MISSING_SKILL_DATA,
+     ISSUE_ID_PREFIX_UNEXPOSED_ENTITY_FOUND,
+     ConnectionType,
+@@ -121,7 +126,25 @@ class ConfigEntryData:
+             self.component_version = str(integration.version)
+ 
+         if self.connection_type in (ConnectionType.CLOUD, ConnectionType.CLOUD_PLUS):
+-            await self._async_setup_cloud_connection()
++            if self.cloud_base_url_configured:
++                ir.async_delete_issue(self._hass, DOMAIN, ISSUE_ID_MISSING_CLOUD_BASE_URL)
++                await self._async_setup_cloud_connection()
++            else:
++                # Config entry created before the cloud address became configurable: don't
++                # connect anywhere until the user enters the address in the integration options.
++                _LOGGER.warning(
++                    f"Cloud address is not set for {self.entry.title}, "
++                    f"the cloud connection will not be established"
++                )
++                ir.async_create_issue(
++                    self._hass,
++                    DOMAIN,
++                    ISSUE_ID_MISSING_CLOUD_BASE_URL,
++                    is_fixable=False,
++                    severity=ir.IssueSeverity.ERROR,
++                    translation_key=ISSUE_ID_MISSING_CLOUD_BASE_URL,
++                    translation_placeholders={"entry_title": self.entry.title},
++                )
+ 
+         if self._hass.state == CoreState.running:
+             await self._async_setup_notifiers()
+@@ -206,6 +229,21 @@ class ConfigEntryData:
+         """Return connection type."""
+         return ConnectionType(str(self.entry.data.get(CONF_CONNECTION_TYPE)))
+ 
++    @property
++    def cloud_base_url_configured(self) -> bool:
++        """Test if the cloud (relay) address is set for the config entry."""
++        return bool(self.entry.data.get(CONF_CLOUD_BASE_URL))
++
++    @property
++    def cloud_base_url(self) -> str:
++        """Return base URL of the cloud (relay) the config entry is connected to."""
++        return str(self.entry.data.get(CONF_CLOUD_BASE_URL) or DEFAULT_CLOUD_BASE_URL).rstrip("/")
++
++    @property
++    def cloud_stream_base_url(self) -> str:
++        """Return base URL of the cloud (relay) used for video streaming."""
++        return str(self.entry.data.get(CONF_CLOUD_STREAM_BASE_URL) or DEFAULT_CLOUD_STREAM_BASE_URL).rstrip("/")
++
+     @property
+     def cloud_instance_id(self) -> str:
+         """Return cloud instance id."""
+@@ -329,6 +367,9 @@ class ConfigEntryData:
+ 
+     async def _async_setup_notifiers(self, *_: Any) -> None:
+         """Set up notifiers."""
++        if self.connection_type == ConnectionType.CLOUD and not self.cloud_base_url_configured:
++            return
++
+         if self.is_reporting_states or self.platform == SmartHomePlatform.VK:
+             ir.async_delete_issue(self._hass, DOMAIN, ISSUE_ID_MISSING_SKILL_DATA)
+         else:
+diff --git a/custom_components/yandex_smart_home/notifier.py b/custom_components/yandex_smart_home/notifier.py
+index 2c1d529..991527c 100644
+--- a/custom_components/yandex_smart_home/notifier.py
++++ b/custom_components/yandex_smart_home/notifier.py
+@@ -32,7 +32,7 @@ from pydantic import ValidationError
+ 
+ from . import DOMAIN
+ from .capability import Capability
+-from .const import CLOUD_BASE_URL, EntityId
++from .const import EntityId
+ from .device import Device, DeviceId
+ from .helpers import APIError, SmartHomePlatform
+ from .property import Property
+@@ -467,7 +467,7 @@ class CloudNotifier(Notifier):
+     @property
+     def _base_url(self) -> str:
+         """Return base URL."""
+-        return f"{CLOUD_BASE_URL}/api/home_assistant/v2/callback/{self._config.platform}"
++        return f"{self._entry_data.cloud_base_url}/api/home_assistant/v2/callback/{self._config.platform}"
+ 
+     @property
+     def _request_headers(self) -> dict[str, str]:
+diff --git a/custom_components/yandex_smart_home/translations/en.json b/custom_components/yandex_smart_home/translations/en.json
+index fd4ab1f..b210806 100644
+--- a/custom_components/yandex_smart_home/translations/en.json
++++ b/custom_components/yandex_smart_home/translations/en.json
+@@ -8,7 +8,8 @@
+       "entities_not_selected": "Необходимо выбрать хотя бы один объект",
+       "missing_config_entry": "Не найдено подходящих интеграций",
+       "already_configured": "Для этого пользователя уже настроена интеграция {entry_title}",
+-      "invalid_skill_id": "Неверный идентификатор навыка или некорректная ссылка на него"
++      "invalid_skill_id": "Неверный идентификатор навыка или некорректная ссылка на него",
++      "invalid_url": "Некорректный адрес, укажите его в формате https://example.com"
+     },
+     "create_entry": {
+       "direct_yandex": "**Прямое подключение настроено!**\n\nТеперь вы можете добавить Home Assistant в Умный дом Яндекса, для этого:\n * Откройте приложение [Дом с Алисой]({ya_iot_app_url})\n* Нажмите кнопку \"+\" в правом верхнем углу, выберите \"Устройство умного дома\"\n* Найдите в списке и выберите навык, который вы создали\n* Нажмите кнопку \"Привязать к Яндексу\", откроется страница авторизации\n* Выполните привязку используя имя пользователя, указанное при настройке интеграции",
+@@ -18,7 +19,7 @@
+       "cloud_plus_vk": "**Облачное Плюс подключение настроено!**\n\nРеквизиты для привязки Home Assistant к приложению {skill}:\n* **Одноразовый код**: `{otp}`\n\nили:\n* **ID**: `{id}`\n* **Пароль**: `{password}`\n\nРеквизиты продублированы в настройках интеграции, сохранять их не требуется.\n\nТеперь вы можете управлять устройствами Home Assistant через Марусю, для этого:\n * Откройте приложение [Маруся]({vk_marusia_app_url})\n* Нажмите иконку \"Домик\" в правом верхнем углу\n* Нажмите кнопку \"+\" в правом верхнем углу, выберите \"Подключить устройство\"\n* Найдите в списке и выберите бренд \"{skill}\"\n* Откроется страница авторизации\n* Выполните привязку используя реквизиты выше\n\nВ [настройках интеграции]({docs_url}/config/getting-started/#gui) вы можете выбрать пользователя, который будет отображаться в Журнале событий."
+     },
+     "step": {
+-      "user" : {
++      "user": {
+         "description": "Добро пожаловать в мастер добавления интеграции Yandex Smart Home!\n\nПосле добавления интеграции вы можете изменить любые её параметры в [настройках]({docs_url}/config/getting-started/#gui), удалять интеграцию и настраивать заново не требуется.\n\nПолезные ссылки:\n* Документация: {docs_url}\n* Чат в Телеграм: {tg_chat_url}"
+       },
+       "connection_type": {
+@@ -31,6 +32,18 @@
+           "connection_type": "\\* [Какой тип подключения лучше?]({docs_url}/config/connection-type/#compare)\n\\* [Подключение нескольких HA]({docs_url}/config/multi-ha/)"
+         }
+       },
++      "cloud_settings": {
++        "title": "Адрес облака",
++        "description": "Укажите адрес сервера (релея), через который Home Assistant будет подключаться к УДЯ.\n\n* Для официального облака Yaha Cloud оставьте значения по умолчанию: `{default_cloud_base_url}` и `{default_cloud_stream_base_url}`\n* Для своего релея укажите его адрес, например `https://relay.example.com` и `https://relay.example.com/stream`",
++        "data": {
++          "cloud_base_url": "Адрес облака",
++          "cloud_stream_base_url": "Адрес облака для видеопотока"
++        },
++        "data_description": {
++          "cloud_base_url": "Используется для регистрации, привязки и постоянного подключения к облаку",
++          "cloud_stream_base_url": "Используется для трансляции видео с камер"
++        }
++      },
+       "platform_direct": {
+         "title": "Прямое подключение",
+         "description": "Перед настройкой прямого подключения убедитесь, что сервер Home Assistant доступен из интернета и локальной сети по адресу **`{external_url}`** ([подробнее]({docs_url}/advanced/direct-connection/) о требованиях и как проверить доступность)",
+@@ -139,12 +152,14 @@
+       "missing_config_entry": "Не найдено подходящих интеграций",
+       "already_configured": "Для этого пользователя уже настроена интеграция {entry_title}",
+       "manual_revoke_oauth_tokens": "Автоматическая отвязка навыков не поддерживается. Вы можете отвязать навыки через удаление Токенов обновления в настройках профиля на вкладке Безопасность",
+-      "invalid_skill_id": "Неверный идентификатор навыка или некорректная ссылка на него"
++      "invalid_skill_id": "Неверный идентификатор навыка или некорректная ссылка на него",
++      "invalid_url": "Некорректный адрес, укажите его в формате https://example.com"
+     },
+     "step": {
+       "init": {
+         "menu_options": {
+           "expose_settings": "Объекты для передачи в УДЯ",
++          "cloud_settings": "Адрес облака",
+           "cloud_credentials": "Реквизиты для привязки",
+           "context_user": "Пользователь в журналах",
+           "skill_yandex_direct": "Параметры навыка",
+@@ -165,6 +180,18 @@
+           "entry_aliases": "Отключите этот параметр, если используете альтернативные названия для функции Assist.\nСм. также: [особенности именования устройств и комнат]({docs_url}/quirks#naming)"
+         }
+       },
++      "cloud_settings": {
++        "title": "Адрес облака",
++        "description": "Укажите адрес сервера (релея), через который Home Assistant будет подключаться к УДЯ.\n\n* Для официального облака Yaha Cloud оставьте значения по умолчанию: `{default_cloud_base_url}` и `{default_cloud_stream_base_url}`\n* Для своего релея укажите его адрес, например `https://relay.example.com` и `https://relay.example.com/stream`",
++        "data": {
++          "cloud_base_url": "Адрес облака",
++          "cloud_stream_base_url": "Адрес облака для видеопотока"
++        },
++        "data_description": {
++          "cloud_base_url": "Используется для регистрации, привязки и постоянного подключения к облаку",
++          "cloud_stream_base_url": "Используется для трансляции видео с камер"
++        }
++      },
+       "update_filter": {
+         "title": "Объекты для передачи в УДЯ",
+         "description": "Выберите интеграцию с которой будут скопированы объекты для передачи в УДЯ. На следующем шаге вы сможете изменить этот список.",
+@@ -278,11 +305,15 @@
+       "title": "Устаревшие настройки прямого подключения",
+       "description": "Служба уведомлений о состоянии устройств (нотификатор) теперь настраивается через [интерфейс]({docs_url}/config/getting-started/#gui) (раздел `Параметры навыка`).\n\nПеренесите настройки из секции `notifier` в настройки интеграции вручную, после этого удалите секцию `notifier` из YAML конфигурации.\n\nДля каждой записи в секции `notifier` потребуется создать отдельную интеграцию с прямым типом подключения."
+     },
++    "missing_cloud_base_url": {
++      "title": "Не указан адрес облака",
++      "description": "Для интеграции {entry_title} не указан адрес облака (релея), облачное подключение не установлено.\n\nОткройте настройки интеграции, выберите пункт **Адрес облака** и укажите адрес сервера — остальные параметры подключения (ID, пароль, привязка) сохранятся."
++    },
+     "missing_integration": {
+       "title": "Не найдена подходящая интеграция",
+       "description": "Для входящего запроса от {platform} не найдена интеграция для пользователя {username}.\n\nДобавьте новую интеграцию Yandex Smart Home с прямым подключением и пользователем {username} в настройках навыка, или измените пользователя у существующей интеграции.\n\nЭта проблема закроется автоматически при следующем удачном запросе или перезапуске Home Assistant."
+     },
+-    "missing_skill_data":{
++    "missing_skill_data": {
+       "title": "Требуется дополнительная настройка",
+       "description": "В настройках интеграции {entry_title} требуется заполнить параметры навыка. Без этих данных интеграция не сможет передавать в УДЯ информацию об актуальном состоянии устройств."
+     },

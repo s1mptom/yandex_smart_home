@@ -32,7 +32,7 @@ from pydantic import ValidationError
 
 from . import DOMAIN
 from .capability import Capability
-from .const import CLOUD_BASE_URL, EntityId
+from .const import EntityId
 from .device import Device, DeviceId
 from .helpers import APIError, SmartHomePlatform
 from .property import Property
@@ -467,7 +467,7 @@ class CloudNotifier(Notifier):
     @property
     def _base_url(self) -> str:
         """Return base URL."""
-        return f"{CLOUD_BASE_URL}/api/home_assistant/v2/callback/{self._config.platform}"
+        return f"{self._entry_data.cloud_base_url}/api/home_assistant/v2/callback/{self._config.platform}"
 
     @property
     def _request_headers(self) -> dict[str, str]:

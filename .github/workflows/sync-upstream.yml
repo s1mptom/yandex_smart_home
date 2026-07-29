@@ -1,8 +1,18 @@
 name: sync-upstream
 
 # Rebuilds this fork as "clean upstream tag + our patches" and publishes a
-# release (HACS updates from releases). The patch is re-applied with sed on top
-# of the pristine upstream tag, so there are never any merge conflicts.
+# release (HACS updates from releases). Our code changes live in patches/ and are
+# re-applied with `git apply -3` on top of the pristine upstream tag; the domain
+# rename (so the fork installs alongside the original) is done with sed here.
+#
+# The cloud/relay address is NOT part of this repo: it is entered in the Home
+# Assistant UI (integration options -> "Адрес облака") and stored in the config
+# entry. Never hardcode a domain here again.
+#
+# If a patch stops applying (upstream refactored the same lines), this job FAILS
+# and publishes nothing — HACS keeps serving the last good release. Fix it by
+# editing custom_components/yandex_smart_home_fork/ on `dev` and running
+# scripts/make-fork-patch.sh, then re-run this workflow.
 #
 # Why a schedule and not a trigger on upstream tags: GitHub only delivers events
 # for THIS repo. Upstream (dext0r/yandex_smart_home) is a different repo we don't
@@ -34,7 +44,6 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     env:
-      RELAY_URL: https://shome-cloud.duckdns.org
       UPSTREAM: https://github.com/dext0r/yandex_smart_home.git
       BRANCH: dev                       # default branch of THIS fork
       OLD_DOMAIN: yandex_smart_home
@@ -66,19 +75,35 @@ jobs:
           fi
           echo "New upstream tag (or forced) — rebuilding."
 
-          # Preserve THIS workflow across the upstream reset (it is not in upstream).
+          # Preserve our fork-only files across the upstream reset (they are not in upstream).
           mkdir -p /tmp/keep
           cp .github/workflows/sync-upstream.yml /tmp/keep/
+          cp -R patches /tmp/keep/
+          cp -R scripts /tmp/keep/
 
           # Reset the branch to the pristine upstream tag, then re-apply our patches.
           git checkout -B "$BRANCH" "$TAG"
+          rm -rf patches scripts
+          cp -R /tmp/keep/patches /tmp/keep/scripts .
 
           SRC="custom_components/$OLD_DOMAIN"
 
-          # 1) Functional change: point the cloud at our relay.
-          sed -i "s|https://yaha-cloud\.ru|$RELAY_URL|g" "$SRC/const.py"
-          # 1b) Point camera video streaming at our relay too (served under /stream).
-          sed -i "s|https://stream.yaha-cloud\.ru|$RELAY_URL/stream|g" "$SRC/const.py"
+          # 1) Functional changes (configurable cloud address, entered in the HA UI).
+          #    Applied against pristine upstream paths, BEFORE the domain rename below.
+          #    -3 falls back to a three-way merge when upstream moved the context around.
+          for p in patches/*.patch; do
+            echo "applying $p"
+            if ! git apply --3way --whitespace=nowarn "$p"; then
+              echo "::error::Patch $p does not apply to upstream $TAG — nothing released. \
+          Fix it on '$BRANCH' with scripts/make-fork-patch.sh and re-run."
+              exit 1
+            fi
+          done
+          # A three-way merge can succeed "with conflicts" — refuse to ship those.
+          if grep -rn '^<<<<<<< ' "$SRC" ; then
+            echo "::error::Conflict markers after applying patches — nothing released."
+            exit 1
+          fi
 
           # 2) Rename the integration domain so it installs ALONGSIDE the original
           #    (HA refuses two integrations with the same domain). HTTP view paths
@@ -100,13 +125,15 @@ jobs:
           cp /tmp/keep/sync-upstream.yml .github/workflows/
 
           echo "--- verify ---"
-          grep -n 'CLOUD_BASE_URL'        "$DST/const.py"
-          grep -n 'CLOUD_STREAM_BASE_URL' "$DST/const.py"
+          grep -n 'DEFAULT_CLOUD_BASE_URL\|DEFAULT_CLOUD_STREAM_BASE_URL' "$DST/const.py"
+          grep -n 'CONF_CLOUD_BASE_URL'   "$DST/const.py"
           grep -n '"domain"'        "$DST/manifest.json"
           grep -n '^DOMAIN'         "$DST/const.py"
+          python3 -m compileall -q "$DST" >/dev/null   # syntax check of the patched code
+          find "$DST" -name '__pycache__' -type d -prune -exec rm -rf {} +
 
           git add -A
-          git commit -m "fork: relay patch + (fork) domain on top of upstream $TAG"
+          git commit -m "fork: configurable cloud + (fork) domain on top of upstream $TAG"
           git push --force origin "$BRANCH"
 
           # The upstream tag of the same name was fetched locally and points to
@@ -119,4 +146,4 @@ jobs:
           gh release delete "$TAG" --yes 2>/dev/null || true
           gh release create "$TAG" \
             --title "$TAG" \
-            --notes "Upstream $TAG + relay patch (CLOUD_BASE_URL -> $RELAY_URL, CLOUD_STREAM_BASE_URL -> $RELAY_URL/stream) + domain renamed to $NEW_DOMAIN for parallel install."
+            --notes "Upstream $TAG + fork patches (cloud/relay address is configured in the Home Assistant UI) + domain renamed to $NEW_DOMAIN for parallel install."
