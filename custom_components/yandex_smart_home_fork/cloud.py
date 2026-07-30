@@ -24,7 +24,9 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_RECONNECTION_DELAY = 2
+# 1s: _try_reconnect doubles this before scheduling, so the first retry lands at 2s
+# instead of 4s. Backoff still doubles up to MAX if the link is genuinely down.
+DEFAULT_RECONNECTION_DELAY = 1
 MAX_RECONNECTION_DELAY = 180
 FAST_RECONNECTION_TIME = timedelta(seconds=6)
 FAST_RECONNECTION_THRESHOLD = 5
@@ -81,7 +83,10 @@ class CloudManager:
             _LOGGER.debug(f"Connecting to {self._url}")
             self._ws = await self._session.ws_connect(
                 self._url,
-                heartbeat=45,
+                # 15s, not upstream's 45: the uplink here is a flaky 5G CGNAT link, where a
+                # re-mapped egress IP kills the flow with no RST. Until a ping/pong times
+                # out the socket looks alive and swallows the next request sent into it.
+                heartbeat=15,
                 compress=15,
                 headers={
                     hdrs.AUTHORIZATION: f"Bearer {self._entry_data.cloud_connection_token}",

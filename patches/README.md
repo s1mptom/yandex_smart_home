@@ -34,3 +34,8 @@ A config entry created before this change has no address stored: the integration
 still loads, the cloud connection is skipped and a repair issue asks the user to
 fill the address in. Entering it reloads the entry and reconnects with the
 existing instance id/token — no re-linking in the Yandex app is needed.
+
+It also tightens the websocket keepalive for a mobile uplink: `heartbeat` 45s →
+15s and `DEFAULT_RECONNECTION_DELAY` 2 → 1. On a 5G CGNAT link a re-mapped
+egress IP kills the connection without an RST, and at the upstream 45s heartbeat
+the socket stays a zombie long enough to swallow whatever is sent into it next.
