@@ -30,10 +30,12 @@ from .cloud import CloudManager
 from .color import ColorProfiles
 from .const import (
     CONF_BACKLIGHT_ENTITY_ID,
+    CONF_CLOUD_BASE_URL,
     CONF_CLOUD_INSTANCE,
     CONF_CLOUD_INSTANCE_CONNECTION_TOKEN,
     CONF_CLOUD_INSTANCE_ID,
     CONF_CLOUD_STREAM,
+    CONF_CLOUD_STREAM_BASE_URL,
     CONF_COLOR_PROFILE,
     CONF_CONNECTION_TYPE,
     CONF_ENTITY_CUSTOM_MODES,
@@ -50,11 +52,14 @@ from .const import (
     CONF_SETTINGS,
     CONF_SKILL,
     CONF_USER_ID,
+    DEFAULT_CLOUD_BASE_URL,
+    DEFAULT_CLOUD_STREAM_BASE_URL,
     DOCS_URL,
     DOMAIN,
     ISSUE_ID_DEPRECATED_PRESSURE_UNIT,
     ISSUE_ID_DEPRECATED_YAML_NOTIFIER,
     ISSUE_ID_DEPRECATED_YAML_SEVERAL_NOTIFIERS,
+    ISSUE_ID_MISSING_CLOUD_BASE_URL,
     ISSUE_ID_MISSING_SKILL_DATA,
     ISSUE_ID_PREFIX_UNEXPOSED_ENTITY_FOUND,
     ConnectionType,
@@ -121,7 +126,25 @@ class ConfigEntryData:
             self.component_version = str(integration.version)
 
         if self.connection_type in (ConnectionType.CLOUD, ConnectionType.CLOUD_PLUS):
-            await self._async_setup_cloud_connection()
+            if self.cloud_base_url_configured:
+                ir.async_delete_issue(self._hass, DOMAIN, ISSUE_ID_MISSING_CLOUD_BASE_URL)
+                await self._async_setup_cloud_connection()
+            else:
+                # Config entry created before the cloud address became configurable: don't
+                # connect anywhere until the user enters the address in the integration options.
+                _LOGGER.warning(
+                    f"Cloud address is not set for {self.entry.title}, "
+                    f"the cloud connection will not be established"
+                )
+                ir.async_create_issue(
+                    self._hass,
+                    DOMAIN,
+                    ISSUE_ID_MISSING_CLOUD_BASE_URL,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key=ISSUE_ID_MISSING_CLOUD_BASE_URL,
+                    translation_placeholders={"entry_title": self.entry.title},
+                )
 
         if self._hass.state == CoreState.running:
             await self._async_setup_notifiers()
@@ -205,6 +228,21 @@ class ConfigEntryData:
     def connection_type(self) -> ConnectionType:
         """Return connection type."""
         return ConnectionType(str(self.entry.data.get(CONF_CONNECTION_TYPE)))
+
+    @property
+    def cloud_base_url_configured(self) -> bool:
+        """Test if the cloud (relay) address is set for the config entry."""
+        return bool(self.entry.data.get(CONF_CLOUD_BASE_URL))
+
+    @property
+    def cloud_base_url(self) -> str:
+        """Return base URL of the cloud (relay) the config entry is connected to."""
+        return str(self.entry.data.get(CONF_CLOUD_BASE_URL) or DEFAULT_CLOUD_BASE_URL).rstrip("/")
+
+    @property
+    def cloud_stream_base_url(self) -> str:
+        """Return base URL of the cloud (relay) used for video streaming."""
+        return str(self.entry.data.get(CONF_CLOUD_STREAM_BASE_URL) or DEFAULT_CLOUD_STREAM_BASE_URL).rstrip("/")
 
     @property
     def cloud_instance_id(self) -> str:
@@ -329,6 +367,9 @@ class ConfigEntryData:
 
     async def _async_setup_notifiers(self, *_: Any) -> None:
         """Set up notifiers."""
+        if self.connection_type == ConnectionType.CLOUD and not self.cloud_base_url_configured:
+            return
+
         if self.is_reporting_states or self.platform == SmartHomePlatform.VK:
             ir.async_delete_issue(self._hass, DOMAIN, ISSUE_ID_MISSING_SKILL_DATA)
         else:

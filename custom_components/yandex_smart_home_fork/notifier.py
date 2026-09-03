@@ -32,7 +32,7 @@ from pydantic import ValidationError
 
 from . import DOMAIN
 from .capability import Capability
-from .const import CLOUD_BASE_URL, EntityId
+from .const import EntityId
 from .device import Device, DeviceId
 from .helpers import APIError, SmartHomePlatform
 from .property import Property
@@ -57,6 +57,14 @@ INITIAL_REPORT_DELAY = timedelta(seconds=15)
 DISCOVERY_REQUEST_DELAY = timedelta(seconds=5)
 HEARTBEAT_REPORT_INTERVAL = timedelta(hours=1)
 REPORT_STATE_WINDOW = timedelta(seconds=1)
+
+# A state notification lost to a transport error is not retried: _async_report_states has
+# already drained PendingStates, so the update is gone until that value changes again. On a
+# flaky mobile uplink (which silently loses a few percent of the pushes) that leaves stale
+# state on the Yandex side, so instead we put the states back and let the next report window
+# re-send them. Capped, so a link that is down for minutes does not re-queue forever — the
+# hourly heartbeat report resyncs everything anyway.
+MAX_CONSECUTIVE_RESENDS = 3
 
 
 @dataclass
@@ -184,6 +192,7 @@ class Notifier(ABC):
         self._session = async_create_clientsession(hass)
 
         self._pending = PendingStates()
+        self._consecutive_send_failures = 0
 
         self._track_entity_states = track_entity_states
         self._track_templates = track_templates
@@ -273,6 +282,7 @@ class Notifier(ABC):
     async def _async_report_states(self, *_: Any) -> None:
         """Send notification about device state change."""
         states: list[DeviceState] = []
+        reported_states: list[ReportableDeviceState] = []
 
         for device_id, device_states in (await self._pending.async_get_all()).items():
             capabilities: list[CapabilityInstanceState] = []
@@ -300,13 +310,16 @@ class Notifier(ABC):
                         properties=properties or None,
                     )
                 )
+                reported_states.extend(device_states)
 
         if states:
             request = CallbackStatesRequest(
                 payload=CallbackStatesRequestPayload(user_id=self._config.user_id, devices=states)
             )
 
-            asyncio.create_task(self._async_send_request(f"{self._base_url}/state", request))  # noqa: RUF006
+            asyncio.create_task(  # noqa: RUF006
+                self._async_send_request(f"{self._base_url}/state", request, reported_states)
+            )
 
         if self._pending.empty:
             self._unsub_report_states = None
@@ -317,8 +330,13 @@ class Notifier(ABC):
                 action=HassJob(self._async_report_states),
             )
 
-    async def _async_send_request(self, url: str, request: CallbackRequest) -> None:
-        """Send a request to the url."""
+    async def _async_send_request(
+        self, url: str, request: CallbackRequest, states: Sequence[ReportableDeviceState] | None = None
+    ) -> None:
+        """Send a request to the url.
+
+        States backing this request are re-queued if it fails on a transport error.
+        """
         try:
             self._debug_log(f"Request: {url} (POST data: {request.as_json()})")
 
@@ -328,6 +346,7 @@ class Notifier(ABC):
                 data=JsonPayload(request.as_json(), dumps=lambda p: p),
                 timeout=ClientTimeout(total=5),
             )
+            self._consecutive_send_failures = 0
 
             response_body, error_message = await r.read(), ""
             try:
@@ -344,11 +363,34 @@ class Notifier(ABC):
                     self._format_log_message(f"State notification request failed: {error_message or r.status}")
                 )
         except ClientConnectionError as e:
-            _LOGGER.warning(self._format_log_message(f"State notification request failed: {e!r}"))
+            await self._async_requeue_states(f"{e!r}", states)
         except TimeoutError as e:
-            self._debug_log(f"State notification request failed: {e!r}")
+            await self._async_requeue_states(f"{e!r}", states)
         except Exception:
             _LOGGER.exception(self._format_log_message("Unexpected exception"))
+
+    async def _async_requeue_states(self, error: str, states: Sequence[ReportableDeviceState] | None) -> None:
+        """Put states of a notification that failed on a transport error back into pending."""
+        self._consecutive_send_failures += 1
+
+        if not states or self._consecutive_send_failures > MAX_CONSECUTIVE_RESENDS:
+            _LOGGER.warning(self._format_log_message(f"State notification request failed: {error}"))
+            return
+
+        # Re-queue rather than resend this payload: _async_report_states reads every value
+        # again and stamps a fresh ts, so a retry can never deliver a state older than one
+        # that got through in the meantime, and changes made while we retry are coalesced.
+        #
+        # Passing no old states means check_value_change() decides what comes back: True for
+        # capabilities and float properties (the values that go stale and need re-sending),
+        # False for plain event properties — deliberately, since re-reporting a momentary
+        # event later would look like it happened twice. Don't "fix" that.
+        await self._pending.async_add(states, [])
+        self._schedule_report_states()
+        self._debug_log(
+            f"State notification request failed: {error}, "
+            f"re-queued {len(states)} state(s) (failure {self._consecutive_send_failures})"
+        )
 
     async def _async_template_result_changed(
         self,
@@ -467,7 +509,7 @@ class CloudNotifier(Notifier):
     @property
     def _base_url(self) -> str:
         """Return base URL."""
-        return f"{CLOUD_BASE_URL}/api/home_assistant/v2/callback/{self._config.platform}"
+        return f"{self._entry_data.cloud_base_url}/api/home_assistant/v2/callback/{self._config.platform}"
 
     @property
     def _request_headers(self) -> dict[str, str]:

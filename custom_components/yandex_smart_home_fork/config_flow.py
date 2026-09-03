@@ -25,19 +25,23 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
     TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
 )
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.setup import async_setup_component
 import voluptuous as vol
+import yarl
 
 from . import DOMAIN, cloud
 from .const import (
-    CLOUD_BASE_URL,
+    CONF_CLOUD_BASE_URL,
     CONF_CLOUD_INSTANCE,
     CONF_CLOUD_INSTANCE_CONNECTION_TOKEN,
     CONF_CLOUD_INSTANCE_ID,
     CONF_CLOUD_INSTANCE_OTP,
     CONF_CLOUD_INSTANCE_PASSWORD,
+    CONF_CLOUD_STREAM_BASE_URL,
     CONF_CONNECTION_TYPE,
     CONF_ENTRY_ALIASES,
     CONF_FILTER,
@@ -46,6 +50,8 @@ from .const import (
     CONF_LINKED_PLATFORMS,
     CONF_SKILL,
     CONF_USER_ID,
+    DEFAULT_CLOUD_BASE_URL,
+    DEFAULT_CLOUD_STREAM_BASE_URL,
     DOCS_URL,
     ConnectionType,
     EntityFilterSource,
@@ -133,6 +139,39 @@ class BaseFlowHandler(FlowHandler["ConfigFlowContext", ConfigFlowResult]):
         self._entry: ConfigEntry | None = None
 
         super().__init__()
+
+    @property
+    def _cloud_base_url(self) -> str:
+        """Return base URL of the cloud (relay) for the flow."""
+        return str(self._data.get(CONF_CLOUD_BASE_URL) or DEFAULT_CLOUD_BASE_URL)
+
+    @property
+    def _cloud_stream_base_url(self) -> str:
+        """Return base URL of the cloud (relay) used for video streaming."""
+        return str(self._data.get(CONF_CLOUD_STREAM_BASE_URL) or DEFAULT_CLOUD_STREAM_BASE_URL)
+
+    def _show_cloud_settings_form(self, user_input: ConfigType, errors: dict[str, str]) -> ConfigFlowResult:
+        """Show the form with cloud (relay) addresses."""
+        return self.async_show_form(
+            step_id="cloud_settings",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_CLOUD_BASE_URL,
+                        default=user_input.get(CONF_CLOUD_BASE_URL, self._cloud_base_url),
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
+                    vol.Required(
+                        CONF_CLOUD_STREAM_BASE_URL,
+                        default=user_input.get(CONF_CLOUD_STREAM_BASE_URL, self._cloud_stream_base_url),
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "default_cloud_base_url": DEFAULT_CLOUD_BASE_URL,
+                "default_cloud_stream_base_url": DEFAULT_CLOUD_STREAM_BASE_URL,
+            },
+        )
 
     async def _async_step_skill_direct(
         self, platform: SmartHomePlatform, user_input: ConfigType | None = None
@@ -227,7 +266,7 @@ class BaseFlowHandler(FlowHandler["ConfigFlowContext", ConfigFlowResult]):
         """Choose skill settings for cloud plus connection."""
         errors: dict[str, str] = {}
         description_placeholders = {
-            "cloud_base_url": CLOUD_BASE_URL,
+            "cloud_base_url": self._cloud_base_url,
             "instance_id": self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
             "docs_url": DOCS_URL,
         }
@@ -494,13 +533,39 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
 
     async def async_step_connection_type(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
         """Choose connection type."""
-        errors = {}
         if user_input is not None:
             self._data.update(user_input)
 
-            if user_input[CONF_CONNECTION_TYPE] == ConnectionType.CLOUD:
+            if user_input[CONF_CONNECTION_TYPE] == ConnectionType.DIRECT:
+                return await self.async_step_platform_direct()
+
+            return await self.async_step_cloud_settings()
+
+        return self.async_show_form(
+            step_id="connection_type",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_CONNECTION_TYPE, default=ConnectionType.CLOUD): CONNECTION_TYPE_SELECTOR}
+            ),
+            description_placeholders={
+                "docs_url": DOCS_URL,
+                "yaha_cloud_skill_url": "https://dialogs.yandex.ru/store/skills/cef326b2-home-assistant",
+            },
+        )
+
+    async def async_step_cloud_settings(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
+        """Enter addresses of the cloud (relay) and register an instance there."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors, cloud_settings = _validate_cloud_settings(user_input)
+
+            if not errors:
+                self._data.update(cloud_settings)
+
+                if self._data[CONF_CONNECTION_TYPE] == ConnectionType.CLOUD_PLUS:
+                    return await self.async_step_platform_cloud_plus()
+
                 try:
-                    instance = await cloud.register_instance(self.hass)
+                    instance = await cloud.register_instance(self.hass, self._cloud_base_url)
                     self._data[CONF_CLOUD_INSTANCE] = {
                         CONF_CLOUD_INSTANCE_ID: instance.id,
                         CONF_CLOUD_INSTANCE_PASSWORD: instance.password,
@@ -511,25 +576,11 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
                     _LOGGER.exception("Failed to register instance in Yandex Smart Home cloud")
 
             if not errors:
-                match user_input[CONF_CONNECTION_TYPE]:
-                    case ConnectionType.DIRECT:
-                        return await self.async_step_platform_direct()
-                    case ConnectionType.CLOUD_PLUS:
-                        return await self.async_step_platform_cloud_plus()
-
                 return await self.async_step_expose_settings()
+        else:
+            user_input = {}
 
-        return self.async_show_form(
-            step_id="connection_type",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_CONNECTION_TYPE, default=ConnectionType.CLOUD): CONNECTION_TYPE_SELECTOR}
-            ),
-            errors=errors,
-            description_placeholders={
-                "docs_url": DOCS_URL,
-                "yaha_cloud_skill_url": "https://dialogs.yandex.ru/store/skills/cef326b2-home-assistant",
-            },
-        )
+        return self._show_cloud_settings_form(user_input, errors)
 
     async def async_step_platform_direct(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
         """Choose smart home platform for direct connection."""
@@ -554,7 +605,9 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
             self._data.update(user_input)
 
             try:
-                instance = await cloud.register_instance(self.hass, SmartHomePlatform(user_input[CONF_PLATFORM]))
+                instance = await cloud.register_instance(
+                    self.hass, self._cloud_base_url, SmartHomePlatform(user_input[CONF_PLATFORM])
+                )
                 self._data[CONF_CLOUD_INSTANCE] = {
                     CONF_CLOUD_INSTANCE_ID: instance.id,
                     CONF_CLOUD_INSTANCE_PASSWORD: instance.password,
@@ -592,6 +645,7 @@ class ConfigFlowHandler(BaseFlowHandler, ConfigFlow, domain=DOMAIN):
             try:
                 description_placeholders[CONF_CLOUD_INSTANCE_OTP] = await cloud.get_instance_otp(
                     self.hass,
+                    self._cloud_base_url,
                     self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
                     self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
                 )
@@ -629,14 +683,35 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
         options = ["expose_settings"]
         match self._data[CONF_CONNECTION_TYPE]:
             case ConnectionType.CLOUD:
-                options += ["cloud_credentials", "context_user"]
+                options += ["cloud_settings", "cloud_credentials", "context_user"]
             case ConnectionType.CLOUD_PLUS:
-                options += ["cloud_credentials", f"skill_{self._data[CONF_PLATFORM]}_cloud_plus", "context_user"]
+                options += [
+                    "cloud_settings",
+                    "cloud_credentials",
+                    f"skill_{self._data[CONF_PLATFORM]}_cloud_plus",
+                    "context_user",
+                ]
             case ConnectionType.DIRECT:
                 options += [f"skill_{self._data[CONF_PLATFORM]}_direct"]
         options += ["maintenance"]
 
         return self.async_show_menu(step_id="init", menu_options=options)
+
+    async def async_step_cloud_settings(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
+        """Change addresses of the cloud (relay)."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors, cloud_settings = _validate_cloud_settings(user_input)
+
+            if not errors:
+                self._data.update(cloud_settings)
+                self.hass.config_entries.async_update_entry(self._entry, data=self._data)
+
+                return await self.async_step_done()
+        else:
+            user_input = {}
+
+        return self._show_cloud_settings_form(user_input, errors)
 
     async def async_step_cloud_credentials(self, user_input: ConfigType | None = None) -> ConfigFlowResult:
         """Show cloud connection credentials."""
@@ -657,6 +732,7 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
         try:
             description_placeholders[CONF_CLOUD_INSTANCE_OTP] = await cloud.get_instance_otp(
                 self.hass,
+                self._cloud_base_url,
                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
             )
@@ -704,6 +780,7 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
                         try:
                             await cloud.revoke_oauth_tokens(
                                 self.hass,
+                                self._cloud_base_url,
                                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
                                 self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
                             )
@@ -722,6 +799,7 @@ class OptionsFlowHandler(OptionsFlow, BaseFlowHandler):
                 try:
                     instance = await cloud.reset_connection_token(
                         self.hass,
+                        self._cloud_base_url,
                         self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_ID],
                         self._data[CONF_CLOUD_INSTANCE][CONF_CLOUD_INSTANCE_CONNECTION_TOKEN],
                     )
@@ -835,6 +913,26 @@ async def async_config_entry_title(hass: HomeAssistant, data: ConfigType, option
             title += f" ({' / '.join(parts)})"
 
     return title
+
+
+def _validate_cloud_settings(config: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Validate cloud (relay) addresses and return errors and normalized config."""
+    errors: dict[str, str] = {}
+    cloud_settings: dict[str, str] = {}
+
+    for key in (CONF_CLOUD_BASE_URL, CONF_CLOUD_STREAM_BASE_URL):
+        url = str(config.get(key, "")).strip().rstrip("/")
+        try:
+            parsed = yarl.URL(url)
+        except ValueError:
+            errors[key] = "invalid_url"
+        else:
+            if parsed.scheme not in ("http", "https") or not parsed.host:
+                errors[key] = "invalid_url"
+
+        cloud_settings[key] = url
+
+    return errors, cloud_settings
 
 
 def _validate_skill_config(

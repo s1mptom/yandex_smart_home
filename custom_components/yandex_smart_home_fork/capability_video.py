@@ -56,7 +56,12 @@ class VideoStreamCapability(ActionOnlyCapabilityMixin, StateCapability[GetStream
         if self._entry_data.use_cloud_stream:
             cloud_stream = component.cloud_streams.get(entity_id)
             if not cloud_stream:
-                cloud_stream = CloudStreamManager(self._hass, stream, async_get_clientsession(self._hass))
+                cloud_stream = CloudStreamManager(
+                    self._hass,
+                    stream,
+                    async_get_clientsession(self._hass),
+                    self._entry_data.cloud_stream_base_url,
+                )
                 component.cloud_streams[entity_id] = cloud_stream
 
             await cloud_stream.async_start()

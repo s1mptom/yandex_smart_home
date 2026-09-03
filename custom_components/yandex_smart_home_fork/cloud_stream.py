@@ -32,8 +32,6 @@ from multidict import MultiDictProxy
 from pydantic import BaseModel
 import yarl
 
-from .const import CLOUD_STREAM_BASE_URL
-
 _LOGGER = logging.getLogger(__name__)
 
 RECONNECTION_DELAY = 2
@@ -73,11 +71,12 @@ class WebRequest:
 class CloudStreamManager:
     """Class to manage cloud connection for streaming."""
 
-    def __init__(self, hass: HomeAssistant, stream: Stream, session: ClientSession):
-        """Initialize a cloud manager with stream and client session."""
+    def __init__(self, hass: HomeAssistant, stream: Stream, session: ClientSession, base_url: str):
+        """Initialize a cloud manager with stream, client session and cloud base URL."""
 
         self._hass = hass
         self._stream = stream
+        self._base_url = base_url.rstrip("/")
         self._running_stream_id: str | None = None
         self._session = session
         self._connected = asyncio.Event()
@@ -91,7 +90,7 @@ class CloudStreamManager:
         if not self._running_stream_id:
             return None
 
-        return f"{CLOUD_STREAM_BASE_URL}/{self._running_stream_id}/master_playlist.m3u8"
+        return f"{self._base_url}/{self._running_stream_id}/master_playlist.m3u8"
 
     async def async_start(self) -> None:
         """Start connection."""
@@ -117,7 +116,7 @@ class CloudStreamManager:
         if not self._running_stream_id:
             return
 
-        ws_url = f"{CLOUD_STREAM_BASE_URL}/{self._running_stream_id}/connect"
+        ws_url = f"{self._base_url}/{self._running_stream_id}/connect"
 
         try:
             _LOGGER.debug(f"Connecting to {ws_url}")

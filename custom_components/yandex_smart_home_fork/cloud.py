@@ -16,7 +16,7 @@ from homeassistant.util import dt
 from pydantic import BaseModel
 
 from . import handlers
-from .const import CLOUD_BASE_URL, DOMAIN, ISSUE_ID_RECONNECTING_TOO_FAST
+from .const import DOMAIN, ISSUE_ID_RECONNECTING_TOO_FAST
 from .helpers import RequestData, SmartHomePlatform
 
 if TYPE_CHECKING:
@@ -24,11 +24,17 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_RECONNECTION_DELAY = 2
+# 1s: _try_reconnect doubles this before scheduling, so the first retry lands at 2s
+# instead of 4s. Backoff still doubles up to MAX if the link is genuinely down.
+DEFAULT_RECONNECTION_DELAY = 1
 MAX_RECONNECTION_DELAY = 180
 FAST_RECONNECTION_TIME = timedelta(seconds=6)
 FAST_RECONNECTION_THRESHOLD = 5
-BASE_API_URL = f"{CLOUD_BASE_URL}/api/home_assistant/v1"
+
+
+def base_api_url(base_url: str) -> str:
+    """Return base URL of the cloud API."""
+    return f"{base_url.rstrip('/')}/api/home_assistant/v1"
 
 
 class CloudInstanceData(BaseModel):
@@ -69,7 +75,7 @@ class CloudManager:
         self._ws_active = True
         self._unsub_connect: CALLBACK_TYPE | None = None
 
-        self._url = f"{BASE_API_URL}/connect"
+        self._url = f"{base_api_url(entry_data.cloud_base_url)}/connect"
 
     async def async_connect(self, *_: Any) -> None:
         """Connect to the cloud."""
@@ -77,7 +83,10 @@ class CloudManager:
             _LOGGER.debug(f"Connecting to {self._url}")
             self._ws = await self._session.ws_connect(
                 self._url,
-                heartbeat=45,
+                # 15s, not upstream's 45: the uplink here is a flaky 5G CGNAT link, where a
+                # re-mapped egress IP kills the flow with no RST. Until a ping/pong times
+                # out the socket looks alive and swallows the next request sent into it.
+                heartbeat=15,
                 compress=15,
                 headers={
                     hdrs.AUTHORIZATION: f"Bearer {self._entry_data.cloud_connection_token}",
@@ -166,26 +175,29 @@ class CloudManager:
         self._unsub_connect = async_call_later(self._hass, self._ws_reconnect_delay, HassJob(self.async_connect))
 
 
-async def register_instance(hass: HomeAssistant, platform: SmartHomePlatform | None = None) -> CloudInstanceData:
+async def register_instance(
+    hass: HomeAssistant, base_url: str, platform: SmartHomePlatform | None = None
+) -> CloudInstanceData:
     """Register a new cloud instance."""
     session = async_create_clientsession(hass)
+    api_url = base_api_url(base_url)
 
     if platform:
-        response = await session.post(f"{BASE_API_URL}/instance/register", json={"platform": platform.value})
+        response = await session.post(f"{api_url}/instance/register", json={"platform": platform.value})
     else:
-        response = await session.post(f"{BASE_API_URL}/instance/register")
+        response = await session.post(f"{api_url}/instance/register")
 
     response.raise_for_status()
 
     return CloudInstanceData.model_validate_json(await response.text())
 
 
-async def get_instance_otp(hass: HomeAssistant, instance_id: str, token: str) -> str:
+async def get_instance_otp(hass: HomeAssistant, base_url: str, instance_id: str, token: str) -> str:
     """Return one time password for a cloud instance linking."""
     session = async_create_clientsession(hass)
 
     response = await session.post(
-        f"{BASE_API_URL}/instance/{instance_id}/otp",
+        f"{base_api_url(base_url)}/instance/{instance_id}/otp",
         headers={hdrs.AUTHORIZATION: f"Bearer {token}"},
     )
     response.raise_for_status()
@@ -193,12 +205,14 @@ async def get_instance_otp(hass: HomeAssistant, instance_id: str, token: str) ->
     return CloudInstanceOTP.model_validate_json(await response.text()).code
 
 
-async def reset_connection_token(hass: HomeAssistant, instance_id: str, token: str) -> CloudInstanceData:
+async def reset_connection_token(
+    hass: HomeAssistant, base_url: str, instance_id: str, token: str
+) -> CloudInstanceData:
     """Reset a cloud instance connection token."""
     session = async_create_clientsession(hass)
 
     response = await session.post(
-        f"{BASE_API_URL}/instance/{instance_id}/reset-connection-token",
+        f"{base_api_url(base_url)}/instance/{instance_id}/reset-connection-token",
         headers={hdrs.AUTHORIZATION: f"Bearer {token}"},
     )
     response.raise_for_status()
@@ -206,12 +220,12 @@ async def reset_connection_token(hass: HomeAssistant, instance_id: str, token: s
     return CloudInstanceData.model_validate_json(await response.text())
 
 
-async def revoke_oauth_tokens(hass: HomeAssistant, instance_id: str, token: str) -> None:
+async def revoke_oauth_tokens(hass: HomeAssistant, base_url: str, instance_id: str, token: str) -> None:
     """Revoke all access and refresh tokens for a cloud instance."""
     session = async_create_clientsession(hass)
 
     response = await session.post(
-        f"{BASE_API_URL}/instance/{instance_id}/oauth/revoke-all",
+        f"{base_api_url(base_url)}/instance/{instance_id}/oauth/revoke-all",
         headers={hdrs.AUTHORIZATION: f"Bearer {token}"},
     )
     response.raise_for_status()
